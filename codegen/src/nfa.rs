@@ -18,18 +18,20 @@ pub enum Etrans {
     More(Vec<usize>)
 }
 
+pub trait StateData {
+    fn no_data() -> Self;
+    fn combine(a: Self, b: Self) -> Self;
+    fn is_final(&self) -> bool;
+}
+
 pub trait State {
-    type Data;
+    type Data: StateData;
     type Iter: Iterator<Item = usize>;
 
     fn new() -> Self;
     fn etransition<'a>(&'a self) -> &'a Etrans;
     fn transition(&self, c: u8) -> Self::Iter;
-
-    fn new_data() -> Self::Data;
     fn data(&self) -> Self::Data;
-    fn combine_data(a: Self::Data, b: Self::Data) -> Self::Data;
-    fn is_final(data: Self::Data) -> bool;
 }
 
 pub struct Automaton<T> where T: State {
@@ -63,7 +65,7 @@ impl<T: State> Automaton<T> {
 
     pub fn eclosure(&self, st: &[usize]) -> (BitSet, T::Data) {
         let mut ret = BitSet::with_capacity(self.states.len());
-        let mut ret_action = T::new_data();
+        let mut ret_action = T::Data::no_data();
         let mut stack = Vec::with_capacity(st.len());
 
         macro_rules! add {
@@ -72,7 +74,7 @@ impl<T: State> Automaton<T> {
                     ret.insert($state);
                     stack.push($state);
 
-                    ret_action = T::combine_data(
+                    ret_action = T::Data::combine(
                         self.states[$state].data(),
                         ret_action
                     );
