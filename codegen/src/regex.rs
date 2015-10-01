@@ -1,6 +1,11 @@
+use std::io::Write;
 use std::rc::Rc;
 use std::ops::Range;
+use std::option::IntoIter;
 use std::slice;
+use nfa;
+use nfa::{No, One, Two, More};
+use util::svec;
 
 pub use self::Regex::{Or, Cat, Maybe, Closure, Class, NotClass, Var, Char, Any, Bind};
 
@@ -64,7 +69,201 @@ pub fn string(string: &str) -> Option<Box<Regex>> {
     Some(reg)
 }
 
+pub struct State {
+    // the McNaughton-Yamada-Thompson
+    // construction algorithm will build
+    // NFAs whose states have 0, 1 or
+    // 2 e-transitions
+    etrans: nfa::Etrans,
+
+    // as for the transitions representation,
+    // most of the time, there will be a single
+    // transition or no transition at all but
+    // we use a SmallVec here to optimize the
+    // case in which there are many transitions
+    // to a single state (typically a character
+    // class)
+    trans: (svec::SVec, usize),
+
+    // 0: no action. otherwise, it's
+    // a f1nal state with an action
+    action: usize
+}
+
+impl nfa::State for State {
+    type Data = usize;
+    type Iter = IntoIter<usize>;
+
+    fn new() -> State {
+        State {
+            trans: (svec::Zero, 0),
+            etrans: No,
+            action: 0
+        }
+    }
+
+    fn etransition<'a>(&'a self) -> &'a nfa::Etrans {
+        &self.etrans
+    }
+
+    fn transition(&self, c: u8) -> IntoIter<usize> {
+        let (ref set, dst) = self.trans;
+        match *set {
+            svec::Many(ref set) if set.contains(c) => Some(dst),
+            svec::ManyBut(ref set) if !set.contains(c) => Some(dst),
+            svec::One(ch) if ch == c => Some(dst),
+            svec::Any => Some(dst),
+            _ => None
+        }.into_iter()
+    }
+
+    fn new_data() -> usize {
+        0
+    }
+
+    fn data(&self) -> usize {
+        self.action
+    }
+
+    fn combine_data(a: usize, b: usize) -> usize {
+        if a >= b { a } else { b }
+    }
+
+    fn is_final(data: Self::Data) -> bool {
+        data != 0
+    }
+}
+
+pub type Automaton = nfa::Automaton<State>;
+
 impl Regex {
+    // creates a new Non-deterministic Finite Automaton using the
+    // McNaughton-Yamada-Thompson construction
+    // takes several regular expressions, each with an attached action
+    pub fn build_nfa(regexs: Vec<(Box<Regex>, usize)>) -> Automaton {
+        let mut ret = Automaton {
+            states: Vec::new(),
+            initial: 0usize
+        };
+
+        let ini = ret.create_state();
+        let mut etrans = Vec::new();
+
+        for (reg, act) in regexs.into_iter() {
+            let (init, f1nal) = reg.to_automaton(&mut ret);
+            etrans.push(init);
+            ret.states[f1nal].action = act;
+        }
+
+        ret.states[ini].etrans = More(etrans);
+        ret.initial = ini;
+        ret
+    }
+
+    // the construction is implemented recursively. Each call builds a
+    // sub-expression of the regex, and returns the f1nals and initial states
+    // only thos states will have to be modified so transitions numbers
+    // won't have to be changed
+    // the initial state is always the last state created, this way we can reuse
+    // it in the concatenation case and avoid adding useless e-transitions
+    fn to_automaton(&self, auto: &mut Automaton) -> (usize, usize) {
+        match *self {
+            Or(ref left, ref right) => {
+                // build sub-FSMs
+                let (linit, lf1nal) = left.to_automaton(auto);
+                let (rinit, rf1nal) = right.to_automaton(auto);
+
+                // create new f1nal and initial states
+                let new_f1nal = auto.create_state();
+                let new_init = auto.create_state();
+
+                // new initial state e-transitions to old init states
+                auto.states[new_init].etrans = Two(linit, rinit);
+
+                // old f1nal states e-transition to new f1nal state
+                auto.states[lf1nal].etrans = One(new_f1nal);
+                auto.states[rf1nal].etrans = One(new_f1nal);
+
+                (new_init, new_f1nal)
+            }
+
+            Cat(ref fst, ref snd) => {
+                let (  _  , sf1nal) = snd.to_automaton(auto);
+
+                // remove the initial state of the right part
+                // this is possible at a cheap cost since the initial
+                // state is always the last created
+                let State {
+                    etrans, trans, ..
+                } = auto.states.pop().unwrap();
+
+                let (finit, ff1nal) = fst.to_automaton(auto);
+                auto.states[ff1nal].etrans = etrans;
+                auto.states[ff1nal].trans = trans;
+
+                (finit, sf1nal)
+            }
+
+            Maybe(ref reg) => {
+                let (init, f1nal) = reg.to_automaton(auto);
+                let new_f1nal = auto.create_state();
+                let new_init = auto.create_state();
+
+                auto.states[new_init].etrans = Two(new_f1nal, init);
+                auto.states[f1nal].etrans = One(new_f1nal);
+
+                (new_init, new_f1nal)
+            }
+
+            Closure(ref reg) => {
+                let (init, f1nal) = reg.to_automaton(auto);
+                let new_f1nal = auto.create_state();
+                let new_init = auto.create_state();
+
+                auto.states[new_init].etrans = Two(new_f1nal, init);
+                auto.states[f1nal].etrans = Two(new_f1nal, init);
+
+                (new_init, new_f1nal)
+            }
+
+            Class(ref vec) => {
+                let f1nal = auto.create_state();
+                let init = auto.create_state();
+                auto.states[init].trans = (svec::Many(vec.clone()), f1nal);
+                (init, f1nal)
+            }
+
+            NotClass(ref set) => {
+                let f1nal = auto.create_state();
+                let init = auto.create_state();
+                auto.states[init].trans = (svec::ManyBut(set.clone()), f1nal);
+                (init, f1nal)
+            }
+
+            Var(ref reg) => {
+                reg.to_automaton(auto)
+            }
+
+            Char(ch) => {
+                let f1nal = auto.create_state();
+                let init = auto.create_state();
+                auto.states[init].trans = (svec::One(ch), f1nal);
+                (init, f1nal)
+            }
+
+            Any => {
+                let f1nal = auto.create_state();
+                let init = auto.create_state();
+                auto.states[init].trans = (svec::Any, f1nal);
+                (init, f1nal)
+            }
+
+            Bind(_, ref expr) => {
+                expr.to_automaton(auto)
+            }
+        }
+    }
+
     #[allow(dead_code)]
     // prints the AST for debugging purposes
     pub fn show(&self, span: &str) {
@@ -99,5 +298,85 @@ impl Regex {
             &Any => println!("Anything"),
             _ => ()
         }
+    }
+}
+
+impl nfa::Automaton<State> {
+    #[allow(dead_code)]
+    #[allow(unused_must_use)]
+    // outs the automaton as a dot file for graphviz
+    // for debugging purposes
+    pub fn todot(&self, out: &mut Write) {
+        writeln!(out, "digraph automata {{");
+        writeln!(out, "\trankdir = LR;");
+        writeln!(out, "\tsize = \"4,4\";");
+        writeln!(out, "\tnode [shape=box]; {};", self.initial);
+        writeln!(out, "\tnode [shape=doublecircle];");
+        write!(out, "\t");
+
+        // outputs f1nal states as doublecircle-shaped nodes
+        for st in (0 .. self.states.len()) {
+            if self.states[st].action != 0 {
+                write!(out, "{} ", st);
+            }
+        }
+
+        writeln!(out, ";\n");
+        writeln!(out, "\tnode [shape=circle];");
+
+        for st in (0 .. self.states.len()) {
+            match self.states[st].trans {
+                (svec::One(ch), dst) => {
+                    let mut esc = String::new();
+                    esc.extend((ch as u8 as char).escape_default());
+                    writeln!(out, "\t{} -> {} [label=\"{}\"];",
+                        st, dst, esc);
+                }
+
+                (svec::Many(ref set), dst) => {
+                    for ch in set.iter().flat_map(|x| x.clone()) {
+                        let mut esc = String::new();
+                        esc.extend((ch as u8 as char).escape_default());
+                        writeln!(out, "\t{} -> {} [label=\"{}\"];",
+                            st, dst, esc);
+                    }
+                }
+
+                (svec::ManyBut(ref set), dst) => {
+                    for ch in set.iter().flat_map(|x| x.clone()) {
+                        let mut esc = String::new();
+                        esc.extend((ch as u8 as char).escape_default());
+                        writeln!(out, "\t{} -> {} [label=\"!{}\"];",
+                            st, dst, esc);
+                    }
+                }
+
+                (svec::Any, dst) => {
+                    writeln!(out, "\t{} -> {} [label=\".\"];",
+                        st, dst);
+                }
+
+                _ => ()
+            }
+
+
+            match self.states[st].etrans {
+                One(s) => {
+                    writeln!(out, "\t{} -> {} [label=\"e\"];", st, s);
+                }
+                Two(s, t) => {
+                    writeln!(out, "\t{} -> {} [label=\"e\"];", st, s);
+                    writeln!(out, "\t{} -> {} [label=\"e\"];", st, t);
+                }
+                More(ref v) => {
+                    for i in v.iter() {
+                        writeln!(out, "\t{} -> {} [label=\"e\"];", st, *i);
+                    }
+                }
+                _ => ()
+            }
+        }
+
+        writeln!(out, "}}");
     }
 }
