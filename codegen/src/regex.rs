@@ -4,9 +4,9 @@ use std::option::IntoIter;
 use std::slice;
 use nfa;
 use nfa::{No, One, Two, More};
-use util::svec;
 
-pub use self::RegexNode::{Or, Cat, Maybe, Closure, Class, NotClass, Var, Char, Any, Bind};
+pub use self::RegexNode::{Or, Cat, Maybe, Closure, Var, Literal, Bind};
+pub use self::Const::{Class, NotClass, Char, Any};
 
 #[derive(Clone)]
 pub struct CharSet(Vec<Range<u8>>);
@@ -33,6 +33,14 @@ impl CharSet {
     }
 }
 
+#[derive(Clone)]
+enum Const {
+    Class(CharSet),
+    NotClass(CharSet),
+    Char(u8),
+    Any,
+}
+
 pub type Regex = Box<RegexNode>;
 
 #[derive(Clone)]
@@ -46,11 +54,8 @@ enum RegexNode {
     Closure(Regex),
 
     // constants
-    Class(CharSet),
-    NotClass(CharSet),
     Var(usize),
-    Char(u8),
-    Any,
+    Literal(Const),
 
     // bind
     Bind(::syntax::ast::Ident, Regex)
@@ -58,13 +63,13 @@ enum RegexNode {
 
 pub fn string(string: &str) -> Option<Regex> {
     let mut it = string.bytes();
-    let mut reg = Box::new(Char(match it.next() {
+    let mut reg = Box::new(Literal(Char(match it.next() {
         Some(ch) => ch,
         None => return None
-    }));
+    })));
 
     for ch in it {
-        reg = Box::new( Cat(reg, Box::new (Char(ch))) );
+        reg = Box::new(Cat(reg, Box::new(Literal(Char(ch)))));
     }
 
     Some(reg)
@@ -101,7 +106,7 @@ pub struct State {
     // case in which there are many transitions
     // to a single state (typically a character
     // class)
-    trans: (svec::SVec, usize),
+    trans: (Option<Const>, usize),
 
     // 0: no action. otherwise, it's
     // a f1nal state with an action
@@ -114,7 +119,7 @@ impl nfa::State for State {
 
     fn new() -> State {
         State {
-            trans: (svec::Zero, 0),
+            trans: (None, 0),
             etrans: No,
             action: Action(0)
         }
@@ -127,10 +132,10 @@ impl nfa::State for State {
     fn transition(&self, c: u8) -> IntoIter<usize> {
         let (ref set, dst) = self.trans;
         match *set {
-            svec::Many(ref set) if set.contains(c) => Some(dst),
-            svec::ManyBut(ref set) if !set.contains(c) => Some(dst),
-            svec::One(ch) if ch == c => Some(dst),
-            svec::Any => Some(dst),
+            Some(Class(ref set)) if set.contains(c) => Some(dst),
+            Some(NotClass(ref set)) if !set.contains(c) => Some(dst),
+            Some(Char(ch)) if ch == c => Some(dst),
+            Some(Any) => Some(dst),
             _ => None
         }.into_iter()
     }
@@ -232,17 +237,17 @@ impl RegexNode {
                 (new_init, new_f1nal)
             }
 
-            Class(ref vec) => {
+            Literal(Class(ref vec)) => {
                 let f1nal = auto.create_state();
                 let init = auto.create_state();
-                auto.states[init].trans = (svec::Many(vec.clone()), f1nal);
+                auto.states[init].trans = (Some(Class(vec.clone())), f1nal);
                 (init, f1nal)
             }
 
-            NotClass(ref set) => {
+            Literal(NotClass(ref set)) => {
                 let f1nal = auto.create_state();
                 let init = auto.create_state();
-                auto.states[init].trans = (svec::ManyBut(set.clone()), f1nal);
+                auto.states[init].trans = (Some(NotClass(set.clone())), f1nal);
                 (init, f1nal)
             }
 
@@ -250,17 +255,17 @@ impl RegexNode {
                 defs[idx].to_automaton(auto, defs)
             }
 
-            Char(ch) => {
+            Literal(Char(ch)) => {
                 let f1nal = auto.create_state();
                 let init = auto.create_state();
-                auto.states[init].trans = (svec::One(ch), f1nal);
+                auto.states[init].trans = (Some(Char(ch)), f1nal);
                 (init, f1nal)
             }
 
-            Any => {
+            Literal(Any) => {
                 let f1nal = auto.create_state();
                 let init = auto.create_state();
-                auto.states[init].trans = (svec::Any, f1nal);
+                auto.states[init].trans = (Some(Any), f1nal);
                 (init, f1nal)
             }
 
@@ -300,8 +305,8 @@ impl RegexNode {
                 defs[idx].show(span, defs);
             }
 
-            &Char(ref c) => println!("{} The char {}", span, *c as char),
-            &Any => println!("Anything"),
+            &Literal(Char(ref c)) => println!("{} The char {}", span, *c as char),
+            &Literal(Any) => println!("Anything"),
             _ => ()
         }
     }
@@ -332,14 +337,14 @@ impl nfa::Automaton<State> {
 
         for st in (0 .. self.states.len()) {
             match self.states[st].trans {
-                (svec::One(ch), dst) => {
+                (Some(Char(ch)), dst) => {
                     let mut esc = String::new();
                     esc.extend((ch as u8 as char).escape_default());
                     writeln!(out, "\t{} -> {} [label=\"{}\"];",
                         st, dst, esc);
                 }
 
-                (svec::Many(ref set), dst) => {
+                (Some(Class(ref set)), dst) => {
                     for ch in set.iter().flat_map(|x| x.clone()) {
                         let mut esc = String::new();
                         esc.extend((ch as u8 as char).escape_default());
@@ -348,7 +353,7 @@ impl nfa::Automaton<State> {
                     }
                 }
 
-                (svec::ManyBut(ref set), dst) => {
+                (Some(NotClass(ref set)), dst) => {
                     for ch in set.iter().flat_map(|x| x.clone()) {
                         let mut esc = String::new();
                         esc.extend((ch as u8 as char).escape_default());
@@ -357,12 +362,12 @@ impl nfa::Automaton<State> {
                     }
                 }
 
-                (svec::Any, dst) => {
+                (Some(Any), dst) => {
                     writeln!(out, "\t{} -> {} [label=\".\"];",
                         st, dst);
                 }
 
-                _ => ()
+                (None, _) => ()
             }
 
 
